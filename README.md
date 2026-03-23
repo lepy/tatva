@@ -71,6 +71,16 @@ gradients = op.grad(nodal_values)
 Examples for various applications will be added very soon. They showcase patterns such as
 mapping custom kernels, working with compound fields, and sparse assembly helpers.
 
+## Example: Dogbone Tension
+
+A finite-strain plane-stress dogbone tension example with Hockett-Sherby hardening is
+available in [`examples/dogbone_tension.py`](examples/dogbone_tension.py). It writes
+force-displacement and necking plots, plus pandas-based history and nodal result files:
+
+```bash
+uv run python examples/dogbone_tension.py --output-dir output/dogbone
+```
+
 ## Dense vs Sparse vs Matrix-free
 
 A unique aspect of `tatva` is that it can handle construct dense matrices, sparse matrices, and matrix-free operators. `tatva` uses matrix-coloring algorithm and sparse differentiation to construct a sparse matrix. We use our own coloring library ![tatva-coloring](https://github.com/smec-ethz/tatva-coloring) to color a matrix based on sparsity pattern, one can use other coloring libraries such as ![pysparsematrixcolorings](https://github.com/gdalle/pysparsematrixcolorings) for more advanced coloring algorithms. This significantly reduces the memory consumption. For large problems, we can also use matrix-free operators which do not require storing the matrix in memory. Since we have a energy functional, we can make use of `jax.jvp` ti compute the matrix-vector product without explicitly forming the matrix. This is particularly useful for large problems where storing the matrix is not feasible.
