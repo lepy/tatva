@@ -17,6 +17,7 @@ arguments-*
 *_venv*
 *venv*
 *jax-cache*
+.jax_cache/
 *egg-info*
 *build*
 uv.lock

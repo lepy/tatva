@@ -9,6 +9,7 @@ import numpy as np
 
 from tatva.material import (
     DogboneGeometry,
+    Hill48PlaneStressMaterial,
     HSPlaneStressMaterial,
     NewtonSettings,
     simulate_dogbone_tension,
@@ -22,31 +23,87 @@ def parse_args() -> argparse.Namespace:
         description="Run a finite-strain plane-stress dogbone tension simulation."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/dogbone"))
-    parser.add_argument("--increments", type=int, default=8)
-    parser.add_argument("--final-displacement", type=float, default=2.0)
-    parser.add_argument("--nx-grip", type=int, default=4)
-    parser.add_argument("--nx-transition", type=int, default=4)
+    parser.add_argument("--increments", type=int, default=16)
+    parser.add_argument("--final-displacement", type=float, default=15.0)
+    parser.add_argument("--nx-grip", type=int, default=2)
+    parser.add_argument("--nx-transition", type=int, default=2)
     parser.add_argument("--nx-gauge", type=int, default=10)
-    parser.add_argument("--ny", type=int, default=8)
-    parser.add_argument("--newton-iters", type=int, default=8)
+    parser.add_argument("--ny", type=int, default=4)
+    parser.add_argument("--newton-iters", type=int, default=10)
     parser.add_argument("--newton-tol", type=float, default=1e-6)
     parser.add_argument("--line-search-steps", type=int, default=6)
-    parser.add_argument("--sigma0", type=float, default=10.0)
-    parser.add_argument("--sigma-inf", type=float, default=120.0)
-    parser.add_argument("--hardening-m", type=float, default=14.0)
+    parser.add_argument(
+        "--yield-model",
+        choices=("isotropic", "hill48"),
+        default="isotropic",
+    )
+    parser.add_argument(
+        "--arc-length",
+        action="store_true",
+        help="Use arc-length continuation instead of pure displacement stepping.",
+    )
+    parser.add_argument(
+        "--arc-radius",
+        type=float,
+        default=0.0,
+        help="Initial arc-length radius. Default derives it from final displacement / increments.",
+    )
+    parser.add_argument(
+        "--arc-scale",
+        type=float,
+        default=1.0,
+        help="Weight for the load-parameter part of the arc-length constraint.",
+    )
+    parser.add_argument(
+        "--arc-growth-factor",
+        type=float,
+        default=1.25,
+        help="Radius growth factor after easy converged arc-length steps.",
+    )
+    parser.add_argument(
+        "--arc-shrink-factor",
+        type=float,
+        default=0.5,
+        help="Radius shrink factor after rejected or difficult arc-length steps.",
+    )
+    parser.add_argument(
+        "--arc-max-steps-factor",
+        type=int,
+        default=8,
+        help="Maximum accepted arc-length steps as a multiple of the nominal increment count.",
+    )
+    parser.add_argument("--sigma0", type=float, default=5.0)
+    parser.add_argument("--sigma-inf", type=float, default=12.0)
+    parser.add_argument("--hardening-m", type=float, default=8.0)
     parser.add_argument("--hardening-n", type=float, default=0.7)
-    parser.add_argument("--grip-length", type=float, default=8.0)
-    parser.add_argument("--transition-length", type=float, default=5.0)
-    parser.add_argument("--gauge-length", type=float, default=18.0)
-    parser.add_argument("--grip-width", type=float, default=10.0)
-    parser.add_argument("--gauge-width", type=float, default=5.0)
-    parser.add_argument("--imperfection-depth", type=float, default=0.02)
-    parser.add_argument("--imperfection-length", type=float, default=3.0)
-    parser.add_argument("--min-displacement-increment", type=float, default=1e-3)
+    parser.add_argument("--hill48-f", type=float, default=0.5)
+    parser.add_argument("--hill48-g", type=float, default=0.5)
+    parser.add_argument("--hill48-h", type=float, default=0.5)
+    parser.add_argument("--hill48-n", type=float, default=1.5)
+    parser.add_argument("--grip-length", type=float, default=20.0)
+    parser.add_argument("--transition-length", type=float, default=12.0)
+    parser.add_argument("--gauge-length", type=float, default=50.0)
+    parser.add_argument("--grip-width", type=float, default=20.0)
+    parser.add_argument("--gauge-width", type=float, default=10.0)
+    parser.add_argument("--imperfection-depth", type=float, default=0.05)
+    parser.add_argument("--imperfection-length", type=float, default=10.0)
+    parser.add_argument("--min-displacement-increment", type=float, default=3e-3)
     parser.add_argument("--max-cutbacks", type=int, default=12)
     parser.add_argument("--fd-eps", type=float, default=1e-6)
     parser.add_argument("--tangent-regularization", type=float, default=1e-8)
     parser.add_argument("--tangent-rebuild-interval", type=int, default=6)
+    parser.add_argument(
+        "--dense-fd-tangent",
+        action="store_true",
+        help="Use the dense finite-difference tangent instead of the default matrix-free Krylov solve.",
+    )
+    parser.add_argument(
+        "--full-newton",
+        action="store_true",
+        help="Disable the cheaper modified-Newton pre-peak path and always use the full displacement-control Newton solve.",
+    )
+    parser.add_argument("--krylov-tol", type=float, default=1e-6)
+    parser.add_argument("--krylov-maxiter", type=int, default=40)
     parser.add_argument(
         "--allow-inexact-steps",
         action="store_true",
@@ -61,15 +118,30 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    material = HSPlaneStressMaterial(
-        mu=80.0,
-        kappa=160.0,
-        sigma0=args.sigma0,
-        sigma_inf=args.sigma_inf,
-        m=args.hardening_m,
-        n=args.hardening_n,
-        newton_maxiter=20,
-    )
+    if args.yield_model == "hill48":
+        material = Hill48PlaneStressMaterial(
+            mu=80.0,
+            kappa=160.0,
+            sigma0=args.sigma0,
+            sigma_inf=args.sigma_inf,
+            m=args.hardening_m,
+            n=args.hardening_n,
+            hill_f=args.hill48_f,
+            hill_g=args.hill48_g,
+            hill_h=args.hill48_h,
+            hill_n=args.hill48_n,
+            newton_maxiter=20,
+        )
+    else:
+        material = HSPlaneStressMaterial(
+            mu=80.0,
+            kappa=160.0,
+            sigma0=args.sigma0,
+            sigma_inf=args.sigma_inf,
+            m=args.hardening_m,
+            n=args.hardening_n,
+            newton_maxiter=20,
+        )
     geometry = DogboneGeometry(
         grip_length=args.grip_length,
         transition_length=args.transition_length,
@@ -83,11 +155,21 @@ def main() -> None:
         max_iters=args.newton_iters,
         tol=args.newton_tol,
         line_search_steps=args.line_search_steps,
+        use_arc_length=args.arc_length,
+        arc_length_radius=args.arc_radius,
+        arc_length_scale=args.arc_scale,
+        arc_length_growth_factor=args.arc_growth_factor,
+        arc_length_shrink_factor=args.arc_shrink_factor,
+        arc_length_max_steps_factor=args.arc_max_steps_factor,
         min_displacement_increment=args.min_displacement_increment,
         max_cutbacks=args.max_cutbacks,
         fd_eps=args.fd_eps,
         tangent_regularization=args.tangent_regularization,
         tangent_rebuild_interval=args.tangent_rebuild_interval,
+        matrix_free=not args.dense_fd_tangent,
+        krylov_tol=args.krylov_tol,
+        krylov_maxiter=args.krylov_maxiter,
+        fast_prepeak=not args.full_newton,
         allow_inexact_steps=args.allow_inexact_steps,
         accepted_residual_ratio=args.accepted_residual_ratio,
     )
@@ -127,6 +209,13 @@ def _save_dataframes(output_dir: Path, result) -> None:
             "center_width": np.asarray(history.center_width),
             "center_width_ratio": np.asarray(history.center_width_ratio),
             "max_epbar": np.asarray(history.max_epbar),
+            "arc_radius": np.asarray(history.arc_radius),
+            "cutbacks": np.asarray(history.cutbacks),
+            "initial_residual_norm": np.asarray(history.initial_residual_norm),
+            "final_residual_norm": np.asarray(history.final_residual_norm),
+            "linear_converged": np.asarray(history.linear_converged),
+            "linear_iterations": np.asarray(history.linear_iterations),
+            "linear_relative_residual": np.asarray(history.linear_relative_residual),
             "converged": np.asarray(history.converged),
             "iterations": np.asarray(history.iterations),
         }

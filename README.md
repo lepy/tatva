@@ -31,13 +31,64 @@ Install the current release from PyPI:
 pip install tatva
 ```
 
-For development work, clone the repository and install it in editable mode (use your preferred virtual environment tool such as `uv` or `venv`):
+For development work, clone the repository and use `uv` to create a local environment:
 
 ```bash
 git clone https://github.com/smec-ethz/tatva.git
 cd tatva
-pip install -e .
+uv sync
 ```
+
+For NVIDIA GPUs on Linux, the project exposes a dedicated `uv` extra that pulls the
+recommended JAX CUDA 13 wheels:
+
+```bash
+uv sync --extra gpu
+```
+
+If your machine or cluster already provides a matching CUDA/cuDNN installation and you
+want JAX to link against those local libraries instead, use:
+
+```bash
+uv sync --extra gpu-local
+```
+
+## High-Performance JAX GPU Setup
+
+For a dedicated NVIDIA GPU machine, the fastest practical `uv` workflow is:
+
+```bash
+uv sync --extra gpu --extra plotting --extra dev
+uv run python -c "import jax; print(jax.default_backend()); print(jax.devices())"
+```
+
+For repeated FEM runs, set the JAX environment before the first import:
+
+```bash
+export JAX_PLATFORMS=cuda
+export JAX_COMPILATION_CACHE_DIR="$PWD/.jax_cache"
+export JAX_ENABLE_X64=True
+```
+
+Recommended interpretation of these settings:
+
+- `JAX_PLATFORMS=cuda` fails fast if the GPU backend is not available, instead of silently falling back to CPU.
+- `JAX_COMPILATION_CACHE_DIR` keeps compiled kernels on disk, which matters a lot for repeated parameter studies and solver reruns.
+- `JAX_ENABLE_X64=True` is the safer default for nonlinear solid mechanics and plasticity. It is not the fastest mode, but it avoids many avoidable convergence and conditioning issues.
+
+For peak throughput on reduced-precision workloads, you can additionally try:
+
+```bash
+export JAX_DEFAULT_MATMUL_PRECISION=tensorfloat32
+```
+
+Use that only if you have validated that `float32`/TF32 accuracy is acceptable for your problem. For many FEM and elastoplastic solves, keeping `x64` is the better trade.
+
+For GPU memory behavior:
+
+- JAX preallocates GPU memory by default. Keep that default for peak throughput and stable benchmarking.
+- Only change `XLA_PYTHON_CLIENT_PREALLOCATE` or `XLA_PYTHON_CLIENT_MEM_FRACTION` when you need to share a GPU or work around OOM at startup.
+- `XLA_PYTHON_CLIENT_ALLOCATOR=platform` is useful for debugging memory issues, not for maximum performance.
 
 ## Documentation
 

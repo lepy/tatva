@@ -1,4 +1,5 @@
 from tatva.material.finite_strain_plane_stress import (
+    Hill48PlaneStressMaterial,
     HSPlaneStressMaterial,
     HSPlaneStressResponse,
     HSPlaneStressState,
@@ -14,20 +15,24 @@ from tatva.material.finite_strain_plane_stress import (
     plane_stress_internal_virtual_work,
     plastic_log_strain_components,
     update_plane_stress,
+    update_plane_stress_batch,
 )
 from tatva.material.dogbone_tension import (
     DogboneGeometry,
     DogboneHistory,
     DogboneMesh,
     DogboneSimulation,
+    JitDogboneResult,
     NewtonSettings,
     build_dogbone_lifter,
     build_dogbone_mesh,
+    make_jit_dogbone_solver,
     simulate_dogbone_tension,
 )
 
 __all__ = [
     "HSPlaneStressMaterial",
+    "Hill48PlaneStressMaterial",
     "HSPlaneStressResponse",
     "HSPlaneStressState",
     "deformation_gradient_from_displacement_gradient",
@@ -35,6 +40,7 @@ __all__ = [
     "DogboneHistory",
     "DogboneMesh",
     "DogboneSimulation",
+    "JitDogboneResult",
     "evaluate_plane_stress_responses",
     "hockett_sherby_yield_stress",
     "hockett_sherby_yield_stress_slope",
@@ -42,6 +48,7 @@ __all__ = [
     "build_dogbone_mesh",
     "make_initial_state",
     "make_initial_state_field",
+    "make_jit_dogbone_solver",
     "make_plane_stress_residual",
     "make_plane_stress_residual_flat",
     "make_plane_stress_tangent_flat",
@@ -50,4 +57,5 @@ __all__ = [
     "plastic_log_strain_components",
     "simulate_dogbone_tension",
     "update_plane_stress",
+    "update_plane_stress_batch",
 ]

@@ -32,6 +32,24 @@ class HSPlaneStressMaterial(eqx.Module):
     plane_stress_eps: float = 1e-6
 
 
+class Hill48PlaneStressMaterial(eqx.Module):
+    """Finite-strain plane-stress Hill48 material with Hockett-Sherby hardening."""
+
+    mu: float
+    kappa: float
+    sigma0: float
+    sigma_inf: float
+    m: float
+    n: float
+    hill_f: float
+    hill_g: float
+    hill_h: float
+    hill_n: float
+    newton_tol: float = 1e-10
+    newton_maxiter: int = 25
+    plane_stress_eps: float = 1e-6
+
+
 class HSPlaneStressResponse(eqx.Module):
     """Local material response for one quadrature point."""
 
@@ -66,14 +84,16 @@ def make_initial_state_field(
     )
 
 
-def hockett_sherby_yield_stress(epbar: Array, material: HSPlaneStressMaterial) -> Array:
+def hockett_sherby_yield_stress(
+    epbar: Array, material: HSPlaneStressMaterial | Hill48PlaneStressMaterial
+) -> Array:
     ep = jnp.maximum(epbar, 0.0)
     saturation = jnp.exp(-material.m * ep**material.n)
     return material.sigma_inf - (material.sigma_inf - material.sigma0) * saturation
 
 
 def hockett_sherby_yield_stress_slope(
-    epbar: Array, material: HSPlaneStressMaterial
+    epbar: Array, material: HSPlaneStressMaterial | Hill48PlaneStressMaterial
 ) -> Array:
     ep = jnp.maximum(epbar, 1e-12)
     prefactor = (material.sigma_inf - material.sigma0) * jnp.exp(
@@ -99,11 +119,22 @@ def deformation_gradient_from_displacement_gradient(grad_u: Array) -> Array:
     return jnp.eye(2, dtype=grad_u.dtype) + grad_u
 
 
+def update_plane_stress_batch(
+    F2: Array,
+    state_n: HSPlaneStressState,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
+) -> HSPlaneStressResponse:
+    """Vectorized hot path for local plane-stress updates on `(n_el, n_qp, ...)` batches."""
+
+    update_qp = lambda F2_qp, state_qp: update_plane_stress(F2_qp, state_qp, material)
+    return jax.vmap(jax.vmap(update_qp, in_axes=(0, 0)), in_axes=(0, 0))(F2, state_n)
+
+
 def evaluate_plane_stress_responses(
     op: Operator,
     u: Array,
     state_n: HSPlaneStressState,
-    material: HSPlaneStressMaterial,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
 ) -> HSPlaneStressResponse:
     """Evaluate local plane-stress responses at all elements and quadrature points.
 
@@ -116,9 +147,7 @@ def evaluate_plane_stress_responses(
         jax.vmap(deformation_gradient_from_displacement_gradient, in_axes=0),
         in_axes=0,
     )(grad_u)
-    update_qp = lambda F2_qp, state_qp: update_plane_stress(F2_qp, state_qp, material)
-    update_fn = jax.vmap(jax.vmap(update_qp, in_axes=(0, 0)), in_axes=(0, 0))
-    return update_fn(F2, state_n)
+    return update_plane_stress_batch(F2, state_n, material)
 
 
 def plane_stress_internal_virtual_work(
@@ -126,7 +155,7 @@ def plane_stress_internal_virtual_work(
     test_u: Array,
     u: Array,
     state_n: HSPlaneStressState,
-    material: HSPlaneStressMaterial,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
 ) -> Array:
     """Return the internal virtual work for a plane-stress finite-strain material."""
 
@@ -188,7 +217,9 @@ def make_plane_stress_tangent_flat(
 
 
 def update_plane_stress(
-    F2: Array, state_n: HSPlaneStressState, material: HSPlaneStressMaterial
+    F2: Array,
+    state_n: HSPlaneStressState,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
 ) -> HSPlaneStressResponse:
     """Update one quadrature point for finite-strain plane-stress J2 plasticity.
 
@@ -203,7 +234,9 @@ def update_plane_stress(
 
 
 def _solve_plane_stress_lambda(
-    F2: Array, state_n: HSPlaneStressState, material: HSPlaneStressMaterial
+    F2: Array,
+    state_n: HSPlaneStressState,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
 ) -> Array:
     def residual(lam3: Array) -> Array:
         return _update_fixed_lambda(F2, state_n, lam3, material).tau[2, 2]
@@ -211,8 +244,11 @@ def _solve_plane_stress_lambda(
     def body(carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
         i, lam3, _ = carry
         r = residual(lam3)
-        dr = _finite_difference_derivative(residual, lam3, material.plane_stress_eps)
+        _, dr_jvp = jax.jvp(residual, (lam3,), (jnp.ones_like(lam3),))
+        dr_fd = _finite_difference_derivative(residual, lam3, material.plane_stress_eps)
+        dr = jnp.where(jnp.isfinite(dr_jvp) & (jnp.abs(dr_jvp) > 1e-14), dr_jvp, dr_fd)
         lam3_new = jnp.maximum(lam3 - r / (dr + 1e-14), 1e-8)
+        lam3_new = jnp.where(jnp.isfinite(lam3_new), lam3_new, lam3)
         err = jnp.abs(lam3_new - lam3)
         return i + 1, lam3_new, err
 
@@ -230,7 +266,23 @@ def _solve_plane_stress_lambda(
 
 
 def _update_fixed_lambda(
-    F2: Array, state_n: HSPlaneStressState, lam3: Array, material: HSPlaneStressMaterial
+    F2: Array,
+    state_n: HSPlaneStressState,
+    lam3: Array,
+    material: HSPlaneStressMaterial | Hill48PlaneStressMaterial,
+) -> HSPlaneStressResponse:
+    if isinstance(material, HSPlaneStressMaterial):
+        return _update_fixed_lambda_isotropic(F2, state_n, lam3, material)
+    if isinstance(material, Hill48PlaneStressMaterial):
+        return _update_fixed_lambda_hill48(F2, state_n, lam3, material)
+    raise TypeError(f"Unsupported plane-stress material: {type(material)!r}")
+
+
+def _update_fixed_lambda_isotropic(
+    F2: Array,
+    state_n: HSPlaneStressState,
+    lam3: Array,
+    material: HSPlaneStressMaterial,
 ) -> HSPlaneStressResponse:
     F = _embed_deformation_gradient(F2, lam3)
     Fp_n = state_n.Fp
@@ -266,6 +318,64 @@ def _update_fixed_lambda(
         ee_dev_new = s_new / (2.0 * material.mu)
         ee_vol_new = (jnp.trace(ee_trial) / 3.0) * _eye3(F.dtype)
         ee_new = ee_dev_new + ee_vol_new
+
+        Ue_new = _spd_exp(ee_new)
+        Re_trial = _polar_rotation(Fe_trial)
+        Fe_new = Re_trial @ Ue_new
+        Fp_new = jnp.linalg.inv(Fe_new) @ F
+        Fp_new = _isochoric_project(Fp_new)
+        epbar_new = state_n.epbar + delta_gamma
+
+        return _build_response(
+            F=F,
+            tau=tau_new,
+            Fp=Fp_new,
+            epbar=epbar_new,
+            lam3=lam3,
+            delta_gamma=delta_gamma,
+            yielded=jnp.array(True),
+        )
+
+    return jax.lax.cond(f_trial <= 0.0, elastic_branch, plastic_branch, operand=None)
+
+
+def _update_fixed_lambda_hill48(
+    F2: Array,
+    state_n: HSPlaneStressState,
+    lam3: Array,
+    material: Hill48PlaneStressMaterial,
+) -> HSPlaneStressResponse:
+    F = _embed_deformation_gradient(F2, lam3)
+    Fp_n = state_n.Fp
+    Fe_trial = F @ jnp.linalg.inv(Fp_n)
+    Ce_trial = _sym(Fe_trial.T @ Fe_trial)
+    ee_trial = 0.5 * _spd_log(Ce_trial)
+
+    tau_trial = _kirchhoff_stress_from_log_strain(ee_trial, material)
+    q_trial = _equivalent_stress(tau_trial, material)
+    f_trial = q_trial - hockett_sherby_yield_stress(state_n.epbar, material)
+
+    def elastic_branch(_: None) -> HSPlaneStressResponse:
+        return _build_response(
+            F=F,
+            tau=tau_trial,
+            Fp=Fp_n,
+            epbar=state_n.epbar,
+            lam3=lam3,
+            delta_gamma=jnp.array(0.0, dtype=F.dtype),
+            yielded=jnp.array(False),
+        )
+
+    def plastic_branch(_: None) -> HSPlaneStressResponse:
+        flow_trial = _flow_direction_from_tau(tau_trial, material)
+        delta_gamma = _solve_delta_gamma_generic(
+            ee_trial=ee_trial,
+            flow_direction=flow_trial,
+            epbar_n=state_n.epbar,
+            material=material,
+        )
+        ee_new = ee_trial - delta_gamma * flow_trial
+        tau_new = _kirchhoff_stress_from_log_strain(ee_new, material)
 
         Ue_new = _spd_exp(ee_new)
         Re_trial = _polar_rotation(Fe_trial)
@@ -342,13 +452,113 @@ def _solve_delta_gamma(
     return delta_gamma
 
 
+def _solve_delta_gamma_generic(
+    *,
+    ee_trial: Array,
+    flow_direction: Array,
+    epbar_n: Array,
+    material: Hill48PlaneStressMaterial,
+) -> Array:
+    q_trial = _equivalent_stress(_kirchhoff_stress_from_log_strain(ee_trial, material), material)
+
+    def consistency(dg: Array) -> Array:
+        ee = ee_trial - dg * flow_direction
+        tau = _kirchhoff_stress_from_log_strain(ee, material)
+        return _equivalent_stress(tau, material) - hockett_sherby_yield_stress(
+            epbar_n + dg, material
+        )
+
+    def trial_q_from_gamma(dg: Array) -> Array:
+        ee = ee_trial - dg * flow_direction
+        tau = _kirchhoff_stress_from_log_strain(ee, material)
+        return _equivalent_stress(tau, material)
+
+    slope0 = hockett_sherby_yield_stress_slope(epbar_n, material)
+    _, dq0 = jax.jvp(trial_q_from_gamma, (jnp.asarray(0.0, dtype=ee_trial.dtype),), (jnp.asarray(1.0, dtype=ee_trial.dtype),))
+    dg0 = jnp.maximum(
+        (q_trial - hockett_sherby_yield_stress(epbar_n, material))
+        / (jnp.maximum(-dq0, 1e-8) + slope0 + 1e-12),
+        0.0,
+    )
+
+    def cond(carry: tuple[Array, Array, Array]) -> Array:
+        i, _, err = carry
+        return (i < material.newton_maxiter) & (err > material.newton_tol)
+
+    def body(carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+        i, dg, _ = carry
+        g = consistency(dg)
+        _, gp_jvp = jax.jvp(consistency, (dg,), (jnp.ones_like(dg),))
+        gp_fd = _finite_difference_derivative(consistency, dg, material.plane_stress_eps)
+        gp = jnp.where(jnp.isfinite(gp_jvp) & (jnp.abs(gp_jvp) > 1e-14), gp_jvp, gp_fd)
+        dg_new = jnp.maximum(dg - g / (gp + 1e-14), 0.0)
+        dg_new = jnp.where(jnp.isfinite(dg_new), dg_new, dg)
+        err = jnp.abs(dg_new - dg)
+        return i + 1, dg_new, err
+
+    init = (
+        jnp.array(0, dtype=jnp.int32),
+        jnp.asarray(dg0, dtype=ee_trial.dtype),
+        jnp.asarray(jnp.inf, dtype=ee_trial.dtype),
+    )
+    _, delta_gamma, _ = jax.lax.while_loop(cond, body, init)
+    return delta_gamma
+
+
 def _kirchhoff_stress_from_log_strain(
-    ee: Array, material: HSPlaneStressMaterial
+    ee: Array, material: HSPlaneStressMaterial | Hill48PlaneStressMaterial
 ) -> Array:
     return (
         2.0 * material.mu * _dev(ee)
         + material.kappa * jnp.trace(ee) * _eye3(ee.dtype)
     )
+
+
+def _equivalent_stress(
+    tau: Array, material: HSPlaneStressMaterial | Hill48PlaneStressMaterial
+) -> Array:
+    if isinstance(material, HSPlaneStressMaterial):
+        s = _dev(tau)
+        return jnp.sqrt(1.5) * _tensor_norm(s)
+    if isinstance(material, Hill48PlaneStressMaterial):
+        t11 = tau[0, 0]
+        t22 = tau[1, 1]
+        t12 = tau[0, 1]
+        phi = (
+            material.hill_g * t11**2
+            + material.hill_f * t22**2
+            + material.hill_h * (t11 - t22) ** 2
+            + 2.0 * material.hill_n * t12**2
+        )
+        return jnp.sqrt(jnp.maximum(phi, 1e-30))
+    raise TypeError(f"Unsupported plane-stress material: {type(material)!r}")
+
+
+def _flow_direction_from_tau(
+    tau: Array, material: HSPlaneStressMaterial | Hill48PlaneStressMaterial
+) -> Array:
+    if isinstance(material, HSPlaneStressMaterial):
+        s = _dev(tau)
+        q = _equivalent_stress(tau, material)
+        return 1.5 * s / (q + 1e-30)
+    if isinstance(material, Hill48PlaneStressMaterial):
+        q = _equivalent_stress(tau, material)
+        g11 = ((material.hill_g + material.hill_h) * tau[0, 0] - material.hill_h * tau[1, 1]) / (
+            q + 1e-30
+        )
+        g22 = ((material.hill_f + material.hill_h) * tau[1, 1] - material.hill_h * tau[0, 0]) / (
+            q + 1e-30
+        )
+        g12 = (2.0 * material.hill_n * tau[0, 1]) / (q + 1e-30)
+        return jnp.array(
+            [
+                [g11, g12, 0.0],
+                [g12, g22, 0.0],
+                [0.0, 0.0, -(g11 + g22)],
+            ],
+            dtype=tau.dtype,
+        )
+    raise TypeError(f"Unsupported plane-stress material: {type(material)!r}")
 
 
 def _embed_deformation_gradient(F2: Array, lam3: Array) -> Array:
@@ -365,7 +575,6 @@ def _embed_deformation_gradient(F2: Array, lam3: Array) -> Array:
 def _finite_difference_derivative(fun, x: Array, eps: float) -> Array:
     step = jnp.asarray(eps, dtype=x.dtype)
     return (fun(x + step) - fun(x - step)) / (2.0 * step)
-
 
 def _sym(A: Array) -> Array:
     return 0.5 * (A + A.T)
